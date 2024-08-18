@@ -42,6 +42,7 @@ from transformers.utils.versions import require_version
 
 import torch
 from module.modeling_transkimer import BertForSequenceClassification as TranskimerForSequenceClassification
+from module.modeling_transkimer_eval import BertForSequenceClassification as EvalTranskimerForSequenceClassification
 from module.modeling_transkimer_roberta import RobertaForSequenceClassification as TranskimerRobertaForSequenceClassification
 from module.modeling_utils import convert_softmax_mask_to_digit
 
@@ -181,6 +182,11 @@ def parse_args():
         action="store_true",
         help="Whether do evaluation after training",
     )
+    parser.add_argument(
+        "--export_onnx",
+        action="store_true",
+        help="Whether onnx export after training",
+    )
 
     args = parser.parse_args()
 
@@ -205,7 +211,7 @@ def main():
     args = parse_args()
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    accelerator = Accelerator()
+    accelerator = Accelerator(mixed_precision='fp16') if args.do_train else Accelerator()
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -293,14 +299,17 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-    if args.from_scratch:
+    if args.from_scratch and 0:
         if args.model_type == 'transkimer':
             config.skim_coefficient = args.skim_coefficient
-            model = TranskimerForSequenceClassification.from_pretrained(
-                args.model_name_or_path,
+            cls = TranskimerForSequenceClassification
+            if (not args.do_train) and args.do_evaluate and args.per_device_eval_batch_size == 1:
+                cls = EvalTranskimerForSequenceClassification
+            model = cls.from_pretrained(
+                'bert-base-uncased',
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
-                state_dict={},
+                state_dict={} if args.model_name_or_path == 'bert-base-uncased' else torch.load(args.model_name_or_path, map_location='cpu')
             )
         elif args.model_type == 'transkimer-roberta':
             config.skim_coefficient = args.skim_coefficient
@@ -315,7 +324,10 @@ def main():
     else:
         if args.model_type == 'transkimer':
             config.skim_coefficient = args.skim_coefficient
-            model = TranskimerForSequenceClassification.from_pretrained(
+            cls = TranskimerForSequenceClassification
+            if (not args.do_train) and args.do_evaluate and args.per_device_eval_batch_size == 1:
+                cls = EvalTranskimerForSequenceClassification
+            model = cls.from_pretrained(
                 args.model_name_or_path,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
@@ -328,8 +340,9 @@ def main():
                 config=config,
             )
         else:
+            print('Use original bert')
             model = AutoModelForSequenceClassification.from_pretrained(
-                args.model_name_or_path,
+                'bert-base-uncased',
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
             )
@@ -389,10 +402,10 @@ def main():
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
 
         if "label" in examples:
-            if label_to_id is not None:
-                # Map labels to IDs (not necessary for GLUE tasks)
-                result["labels"] = [label_to_id[l] for l in examples["label"]]
-            else:
+            # if label_to_id is not None:
+            #     # Map labels to IDs (not necessary for GLUE tasks)
+            #     result["labels"] = [label_to_id[l] for l in examples["label"]]
+            # else:
                 # In all cases, rename the column to labels because the model will expect that.
                 result["labels"] = examples["label"]
         return result
@@ -527,10 +540,15 @@ def main():
                     logger.info(f"epoch {epoch}: {eval_metric}, skim_loss: {torch.mean(torch.stack(all_skim_loss))}, tokens_remained: {torch.mean(torch.stack(all_tokens_remained))}, layers: {' '.join([f'{i} {torch.mean(torch.stack(macs))}' for i,macs in enumerate(all_layer_tokens_remained)])}")
                 else:
                     logger.info(f"epoch {epoch}: {eval_metric}")
+    else:
+        print('SKIP train')
 
     if args.do_evaluate:
+        import time
+        start_time = time.time()
         with torch.no_grad():
             model.eval()
+            print(eval_dataloader)
             all_skim_loss, all_tokens_remained = list(), list()
             all_layer_tokens_remained = [[] for _ in range(config.num_hidden_layers)]
             for step, batch in enumerate(eval_dataloader):
@@ -545,18 +563,29 @@ def main():
                     all_tokens_remained.append(outputs.tokens_remained)
                     for layer_idx,mac in enumerate(outputs.layer_tokens_remained):
                         all_layer_tokens_remained[layer_idx].append(mac)
-
-
+            from pathlib import Path
+            # torch.save(all_layer_tokens_remained, Path(args.output_dir, 'all_layer_tokens_remained'))
+            # torch.save(all_tokens_remained, Path(args.output_dir, 'all_tokens_remained'))
             eval_metric = metric.compute()
-            if 'transkimer' in args.model_type:
+            # if 'transkimer' in args.model_type:
+            try:
                 logger.info(f"eval: {eval_metric}, skim_loss: {torch.mean(torch.stack(all_skim_loss))}, tokens_remained: {torch.mean(torch.stack(all_tokens_remained))}, layers: {' '.join([f'{i} {torch.mean(torch.stack(macs))}' for i,macs in enumerate(all_layer_tokens_remained)])}")
-            else:
+            except:
                 logger.info(f"eval: {eval_metric}")
+        end_time = time.time()
+        print('EVAL TIME CONSUMES:', end_time - start_time)
+        with open(Path(args.output_dir, 'eval_time.txt'), 'w') as f:
+            f.write(str(end_time - start_time))
+                
+    if args.export_onnx:
+        with torch.no_grad():
+            export_model(model, args, eval_dataloader)
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+        if args.do_train:
+            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
 
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
@@ -577,6 +606,47 @@ def main():
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
+
+    from module.modeling_transkimer import temp_storage
+    from pathlib import Path
+    if not args.do_train:
+        torch.save(temp_storage, Path(args.output_dir, 'skim_masks.pth'))
+
+
+
+def export_model(model, args, eval_dataloader):
+    import torch
+    import torch.onnx
+    from pathlib import Path
+    # Input to the model
+    device = None
+    for p in model.parameters():
+        device = p.device
+        break
+    input_ = {}
+    model.eval()    
+    for batch in eval_dataloader:
+        input_ = batch
+        if 'label' in input_:
+            input_.pop('label')
+        if 'labels' in input_:
+            input_.pop('labels')
+        break
+    print(input_.keys())
+
+    torch_out = model(**input_)
+    # Export the model
+    torch.onnx.export(model,               # model being run
+                    tuple(input_.values()),                         # model input (or a tuple for multiple inputs)
+                    Path(args.output_dir, "model.onnx").as_posix(),   # where to save the model (can be a file or file-like object)
+                    export_params=True,        # store the trained parameter weights inside the model file
+                    opset_version=11,          # the ONNX version to export the model to
+                    do_constant_folding=True,  # whether to execute constant folding for optimization
+                    input_names = list(input_.keys()),   # the model's input names
+                    output_names = ['output'], # the model's output names
+                    dynamic_axes={x: {1: 'sequence_length'} for x in input_.keys() # variable length axes
+                                 }
+    )
 
 
 if __name__ == "__main__":

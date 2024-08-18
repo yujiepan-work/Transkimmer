@@ -333,7 +333,7 @@ class BertSelfAttention(nn.Module):
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
         # mask attention probs during training for skimming
-        attention_probs = attention_probs * skim_mask[:, None, None, :]
+        # attention_probs = attention_probs * skim_mask[:, None, None, :]
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -574,19 +574,28 @@ class BertEncoder(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            skim_mask = nn.functional.gumbel_softmax(self.skim_predictors[i](hidden_states[:,1:,:]), hard=True, tau=1)
-            skim_mask = skim_mask[:,:,1]
-            skim_mask_with_cls = torch.ones(skim_mask.shape[0], skim_mask.shape[1]+1, device=skim_mask.device) # 1: preserve
-            skim_mask_with_cls[:,1:] = skim_mask
-            skim_mask = skim_mask_with_cls  # B x L
+            if self.training:
+                skim_mask = nn.functional.gumbel_softmax(self.skim_predictors[i](hidden_states[:,1:,:]), hard=True, tau=1)
+                skim_mask = skim_mask[:,:,1]
+                skim_mask_with_cls = torch.ones(skim_mask.shape[0], skim_mask.shape[1]+1, device=skim_mask.device) # 1: preserve
+                skim_mask_with_cls[:,1:] = skim_mask
+                skim_mask = skim_mask_with_cls  # B x L
+            else:
+                skim_mask_logits = self.skim_predictors[i](hidden_states)
+                skim_mask = torch.argmax(skim_mask_logits, dim=-1).float() # B * L
+                skim_mask[:, 0] = 1.
+                skim_mask_bool = skim_mask.bool()
+                hidden_states = hidden_states[skim_mask_bool].reshape(1, -1, hidden_states.shape[-1])
+                attention_mask = attention_mask[skim_mask_bool[:, None, None, :]].reshape(1,1,1,-1)
+
             # multiple current layer skim mask with last layer skim mask
             # to gurantee skimmed tokens are never recovered
-            if all_skim_mask:
-                skim_mask = skim_mask * all_skim_mask[-1]
-            all_skim_mask += (skim_mask, )
+            # if all_skim_mask:
+            #     skim_mask = skim_mask * all_skim_mask[-1]
+            # all_skim_mask += (skim_mask, )
 
-            if not self.training and skim_mask.shape[0] == 1:
-                temp_storage[i].append(skim_mask.detach().cpu().half())
+            # if not self.training and skim_mask.shape[0] == 1:
+            #     temp_storage[i].append(skim_mask.detach().cpu().half())
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
             past_key_value = past_key_values[i] if past_key_values is not None else None
@@ -627,7 +636,9 @@ class BertEncoder(nn.Module):
                 )
 
             hidden_states = layer_outputs[0]
-            forward_hidden_states = forward_hidden_states * (1-skim_mask.view(*skim_mask.shape,1)) + hidden_states * skim_mask.view(*skim_mask.shape,1)
+            # forward_hidden_states = forward_hidden_states * (1-skim_mask.view(*skim_mask.shape,1)) + hidden_states * skim_mask.view(*skim_mask.shape,1)
+            forward_hidden_states = hidden_states
+            # print(forward_hidden_states.shape)
             # preserve the maksed tokens
             # binary_skim_mask = skim_mask.to(dtype=torch.bool)
             # forward_hidden_states[binary_skim_mask] = hidden_states[binary_skim_mask]
@@ -1403,15 +1414,15 @@ class BertForMaskedLM(BertPreTrainedModel):
             return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
         skim_loss, neat_mac = 0.0, 0.0
-        layer_neat_mac = list()
-        all_tokens_length = torch.mean(torch.sum(attention_mask.to(torch.float32),dim=-1))
-        for mask in outputs.skim_mask:
-            accumulated_skim_mask = torch.mean(torch.sum(mask,dim=1))
-            skim_loss += accumulated_skim_mask/mask.shape[1]
-            layer_neat_mac.append(accumulated_skim_mask/all_tokens_length)
-            neat_mac += accumulated_skim_mask/all_tokens_length
-        skim_loss /= self.config.num_hidden_layers
-        neat_mac /= self.config.num_hidden_layers
+        # layer_neat_mac = list()
+        # all_tokens_length = torch.mean(torch.sum(attention_mask.to(torch.float32),dim=-1))
+        # for mask in outputs.skim_mask:
+        #     accumulated_skim_mask = torch.mean(torch.sum(mask,dim=1))
+        #     skim_loss += accumulated_skim_mask/mask.shape[1]
+        #     layer_neat_mac.append(accumulated_skim_mask/all_tokens_length)
+        #     neat_mac += accumulated_skim_mask/all_tokens_length
+        # skim_loss /= self.config.num_hidden_layers
+        # neat_mac /= self.config.num_hidden_layers
         classification_loss = masked_lm_loss
         # print(skim_loss, neat_mac, loss)
         # loss = skim_loss
@@ -1594,11 +1605,11 @@ class BertForSequenceClassification(BertPreTrainedModel):
             If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        if input_ids.shape[0] == 1 and self.training: # i dont know why even with bs=1, there is still some mask
-            attention_mask_bool = (attention_mask == 1)
-            input_ids = input_ids[None, attention_mask_bool]
-            token_type_ids = token_type_ids[None, attention_mask_bool]
-            attention_mask = attention_mask[None, attention_mask_bool]
+        # if input_ids.shape[0] == 1: # i dont know why even with bs=1, there is still some mask
+        #     attention_mask_bool = (attention_mask == 1)
+        #     input_ids = input_ids[None, attention_mask_bool]
+        #     token_type_ids = token_type_ids[None, attention_mask_bool]
+        #     attention_mask = attention_mask[None, attention_mask_bool]
 
         outputs = self.bert(
             input_ids,
@@ -1645,14 +1656,14 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
         skim_loss, neat_mac = 0.0, 0.0
         layer_neat_mac = list()
-        all_tokens_length = torch.mean(torch.sum(attention_mask.to(torch.float32),dim=-1))
-        for mask in outputs.skim_mask:
-            accumulated_skim_mask = torch.mean(torch.sum(mask,dim=1))
-            skim_loss += accumulated_skim_mask/mask.shape[1]
-            layer_neat_mac.append(accumulated_skim_mask/all_tokens_length)
-            neat_mac += accumulated_skim_mask/all_tokens_length
-        skim_loss /= self.config.num_hidden_layers
-        neat_mac /= self.config.num_hidden_layers
+        # all_tokens_length = torch.mean(torch.sum(attention_mask.to(torch.float32),dim=-1))
+        # for mask in outputs.skim_mask:
+        #     accumulated_skim_mask = torch.mean(torch.sum(mask,dim=1))
+        #     skim_loss += accumulated_skim_mask/mask.shape[1]
+        #     layer_neat_mac.append(accumulated_skim_mask/all_tokens_length)
+        #     neat_mac += accumulated_skim_mask/all_tokens_length
+        # skim_loss /= self.config.num_hidden_layers
+        # neat_mac /= self.config.num_hidden_layers
         classification_loss = loss
         # print(skim_loss, neat_mac, loss)
         # loss = skim_loss
